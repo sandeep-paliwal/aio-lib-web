@@ -245,11 +245,13 @@ describe('RemoteStorage', () => {
     }
     expect(response).toStrictEqual(expected)
 
+    console.log('----start -----')
     // check application of folder content rule /testfolder/*
     response = rs.getResponseHeadersForFile(fakeDistRoot + 'testfolder/index.html', fakeDistRoot, newConfig)
     expected = {
       'adp-testHeader': 'folder-header'
     }
+    console.log('----end -----')
     expect(response).toStrictEqual(expected)
 
     // check application of specific extension within folder /testfolder/*.js
