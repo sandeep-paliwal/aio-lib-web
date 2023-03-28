@@ -224,10 +224,10 @@ describe('RemoteStorage', () => {
         '/*': {
           testHeader: 'generic-header'
         },
-        '/testfolder/*': {
+        '/testFolder/*': {
           testHeader: 'folder-header'
         },
-        '/testfolder/*.js': {
+        '/testFolder/*.js': {
           testHeader: 'all-js-file-in-folder-header'
         },
         '/test.js': {
@@ -236,37 +236,23 @@ describe('RemoteStorage', () => {
       }
     })
 
-    const fakeDistRoot = '/fake/web-prod/'
+    await global.addFakeFiles(vol, 'fakeDir', ['index.html', 'test.js', 'testFolder/index.html', 'testFolder/test.js'])
+    const files = await rs.walkDir('fakeDir')
+    const fakeDistRoot = files[0].substring(0, files[0].indexOf('index.html'))
 
-    // check application of generic rule /*
-    let response = rs.getResponseHeadersForFile(fakeDistRoot + 'index.html', fakeDistRoot, newConfig)
-    let expected = {
-      'adp-testHeader': 'generic-header'
+    const expectedValMap = {
+      'index.html': { 'adp-testHeader': 'generic-header' },
+      'test.js': { 'adp-testHeader': 'specific-file-header' },
+      'testFolder/index.html': { 'adp-testHeader': 'folder-header' },
+      'testFolder/test.js': { 'adp-testHeader': 'all-js-file-in-folder-header' }
     }
-    expect(response).toStrictEqual(expected)
 
-    console.log('----start -----')
-    // check application of folder content rule /testfolder/*
-    response = rs.getResponseHeadersForFile(fakeDistRoot + 'testfolder/index.html', fakeDistRoot, newConfig)
-    expected = {
-      'adp-testHeader': 'folder-header'
-    }
-    console.log('----end -----')
-    expect(response).toStrictEqual(expected)
-
-    // check application of specific extension within folder /testfolder/*.js
-    response = rs.getResponseHeadersForFile(fakeDistRoot + 'testfolder/test.js', fakeDistRoot, newConfig)
-    expected = {
-      'adp-testHeader': 'all-js-file-in-folder-header'
-    }
-    expect(response).toStrictEqual(expected)
-
-    // check application of specific file
-    response = rs.getResponseHeadersForFile(fakeDistRoot + 'test.js', fakeDistRoot, newConfig)
-    expected = {
-      'adp-testHeader': 'specific-file-header'
-    }
-    expect(response).toStrictEqual(expected)
+    files.forEach(f => {
+      const fileName = f.replace(fakeDistRoot, '')
+      const response = rs.getResponseHeadersForFile(f, fakeDistRoot, newConfig)
+      const expected = expectedValMap[fileName]
+      expect(response).toStrictEqual(expected)
+    })
   })
 
   test('get response header with invalid header name', async () => {
