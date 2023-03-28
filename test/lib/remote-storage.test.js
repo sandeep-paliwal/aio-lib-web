@@ -20,6 +20,7 @@ jest.mock('@aws-sdk/client-s3', () => Object({ S3: jest.fn(() => { return mockS3
 
 const { S3 } = require('@aws-sdk/client-s3')
 const { vol } = global.mockFs()
+const path = require('path')
 
 const RemoteStorage = require('../../lib/remote-storage')
 
@@ -145,7 +146,7 @@ describe('RemoteStorage', () => {
   test('uploadFile should call S3#upload with the correct parameters', async () => {
     global.addFakeFiles(vol, 'fakeDir', { 'index.js': 'fake content' })
     const rs = new RemoteStorage(global.fakeTVMResponse)
-    const fakeConfig = {}
+    const fakeConfig = global.fakeConfig
     await rs.uploadFile('fakeDir/index.js', 'fakeprefix', fakeConfig)
     const body = Buffer.from('fake content', 'utf8')
     expect(mockS3.putObject).toHaveBeenCalledWith(expect.objectContaining({ Bucket: 'fake-bucket', Key: 'fakeprefix/index.js', Body: body, ContentType: 'application/javascript' }))
@@ -154,7 +155,7 @@ describe('RemoteStorage', () => {
   test('uploadFile should call S3#upload with the correct parameters and slash-prefix', async () => {
     global.addFakeFiles(vol, 'fakeDir', { 'index.js': 'fake content' })
     const rs = new RemoteStorage(global.fakeTVMResponse)
-    const fakeConfig = {}
+    const fakeConfig = global.fakeConfig
     await rs.uploadFile('fakeDir/index.js', '/slash-prefix', fakeConfig)
     const body = Buffer.from('fake content', 'utf8')
     expect(mockS3.putObject).toHaveBeenCalledWith(expect.objectContaining({ Bucket: 'fake-bucket', Key: '/slash-prefix/index.js', Body: body, ContentType: 'application/javascript' }))
@@ -173,7 +174,7 @@ describe('RemoteStorage', () => {
   test('uploadDir should call S3#upload one time per file', async () => {
     await global.addFakeFiles(vol, 'fakeDir', ['index.js', 'index.css', 'index.html'])
     const rs = new RemoteStorage(global.fakeTVMResponse)
-    await rs.uploadDir('fakeDir', 'fakeprefix', global.fakeConfig.creds.cna)
+    await rs.uploadDir('fakeDir', 'fakeprefix', global.fakeConfig)
     expect(mockS3.putObject).toHaveBeenCalledTimes(3)
   })
 
@@ -182,37 +183,133 @@ describe('RemoteStorage', () => {
     const cbMock = jest.fn()
     const rs = new RemoteStorage(global.fakeTVMResponse)
 
-    await rs.uploadDir('fakeDir', 'fakeprefix', global.fakeConfig.cna, cbMock)
+    await rs.uploadDir('fakeDir', 'fakeprefix', global.fakeConfig, cbMock)
     expect(cbMock).toHaveBeenCalledTimes(4)
   })
 
   test('cachecontrol string for html', async () => {
     const rs = new RemoteStorage(global.fakeTVMResponse)
-    const response = rs._getCacheControlConfig('text/html', global.fakeConfig.cna)
+    const response = rs._getCacheControlConfig('text/html', global.fakeConfig.app)
     expect(response).toBe('s-maxage=0, max-age=60')
   })
 
   test('cachecontrol string for JS', async () => {
     const rs = new RemoteStorage(global.fakeTVMResponse)
-    const response = rs._getCacheControlConfig('application/javascript', global.fakeConfig.cna)
+    const response = rs._getCacheControlConfig('application/javascript', global.fakeConfig.app)
     expect(response).toBe('s-maxage=0, max-age=604800')
   })
 
   test('cachecontrol string for CSS', async () => {
     const rs = new RemoteStorage(global.fakeTVMResponse)
-    const response = rs._getCacheControlConfig('text/css', global.fakeConfig.cna)
+    const response = rs._getCacheControlConfig('text/css', global.fakeConfig.app)
     expect(response).toBe('s-maxage=0, max-age=604800')
   })
 
   test('cachecontrol string for Image', async () => {
     const rs = new RemoteStorage(global.fakeTVMResponse)
-    const response = rs._getCacheControlConfig('image/jpeg', global.fakeConfig.cna)
+    const response = rs._getCacheControlConfig('image/jpeg', global.fakeConfig.app)
     expect(response).toBe('s-maxage=0, max-age=604800')
   })
 
   test('cachecontrol string for default', async () => {
     const rs = new RemoteStorage(global.fakeTVMResponse)
-    const response = rs._getCacheControlConfig('application/pdf', global.fakeConfig.cna)
+    const response = rs._getCacheControlConfig('application/pdf', global.fakeConfig.app)
     expect(response).toBe('s-maxage=0')
+  })
+
+  // response header tests
+  test('get response header from config with multiple rules', async () => {
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    const newConfig = global.configWithModifiedWeb(global.fakeConfig, {
+      'response-headers': {
+        '/*': {
+          testHeader: 'generic-header'
+        },
+        '/testFolder/*': {
+          testHeader: 'folder-header'
+        },
+        '/testFolder/*.js': {
+          testHeader: 'all-js-file-in-folder-header'
+        },
+        '/test.js': {
+          testHeader: 'specific-file-header'
+        }
+      }
+    })
+
+    const folderPath1 = 'testFolder' + path.sep + 'index.html'
+    const folderPath2 = 'testFolder' + path.sep + 'test.js'
+    await global.addFakeFiles(vol, 'fakeDir', ['index.html', 'test.js', folderPath1, folderPath2])
+    const files = await rs.walkDir('fakeDir')
+    const fakeDistRoot = files[0].substring(0, files[0].indexOf('index.html'))
+
+    const expectedValMap = {
+      'index.html': { 'adp-testHeader': 'generic-header' },
+      'test.js': { 'adp-testHeader': 'specific-file-header' }
+    }
+    expectedValMap[folderPath1] = { 'adp-testHeader': 'folder-header' }
+    expectedValMap[folderPath2] = { 'adp-testHeader': 'all-js-file-in-folder-header' }
+
+    files.forEach(f => {
+      const fileName = f.replace(fakeDistRoot, '')
+      const response = rs.getResponseHeadersForFile(f, fakeDistRoot, newConfig)
+      const expected = expectedValMap[fileName]
+      expect(response).toStrictEqual(expected)
+    })
+  })
+
+  test('get response header with invalid header name', async () => {
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    const newConfig = global.configWithModifiedWeb(global.fakeConfig, {
+      'response-headers': {
+        '/*': {
+          無効な名前: 'generic-header'
+        }
+      }
+    })
+
+    const fakeDistRoot = '/fake/web-prod/'
+    expect(() => rs.getResponseHeadersForFile(fakeDistRoot + 'index.html', fakeDistRoot, newConfig)).toThrowWithMessageContaining(
+      '[WebLib:ERROR_INVALID_HEADER_NAME] `無効な名前` is not a valid response header name')
+  })
+
+  test('get response header with invalid header value', async () => {
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    const newConfig = global.configWithModifiedWeb(global.fakeConfig, {
+      'response-headers': {
+        '/*': {
+          testHeader: '無効な値'
+        }
+      }
+    })
+
+    const fakeDistRoot = '/fake/web-prod/'
+    expect(() => rs.getResponseHeadersForFile(fakeDistRoot + 'index.html', fakeDistRoot, newConfig)).toThrowWithMessageContaining(
+      '[WebLib:ERROR_INVALID_HEADER_VALUE] `無効な値` is not a valid response header value for `testHeader`')
+  })
+
+  test('Metadata check for response headers', async () => {
+    global.addFakeFiles(vol, 'fakeDir', { 'index.js': 'fake content' })
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    const newConfig = global.configWithModifiedWeb(global.fakeConfig, {
+      'response-headers': {
+        '/*': {
+          testHeader: 'generic-header'
+        }
+      }
+    })
+    // const fakeConfig = {}
+    await rs.uploadFile('fakeDir/index.js', 'fakeprefix', newConfig)
+    const body = Buffer.from('fake content', 'utf8')
+    const expected = {
+      Bucket: 'fake-bucket',
+      Key: 'fakeprefix/index.js',
+      Body: body,
+      ContentType: 'application/javascript',
+      Metadata: {
+        'adp-testHeader': 'generic-header'
+      }
+    }
+    expect(mockS3.putObject).toHaveBeenCalledWith(expect.objectContaining(expected))
   })
 })
