@@ -10,278 +10,306 @@ OF ANY KIND, either express or implied. See the License for the specific languag
 governing permissions and limitations under the License.
 */
 
+const mockS3 = {
+  listObjectsV2: jest.fn(),
+  deleteObjects: jest.fn(),
+  putObject: jest.fn()
+}
+
+jest.mock('@aws-sdk/client-s3', () => Object({ S3: jest.fn(() => { return mockS3 }) }))
+
 const { S3 } = require('@aws-sdk/client-s3')
+const { vol } = global.mockFs()
 const path = require('path')
-const mime = require('mime-types')
-const fs = require('fs-extra')
-const joi = require('joi')
-const klaw = require('klaw')
-const http = require('http')
-const { codes, logAndThrow } = require('./StorageError')
 
-const fileExtensionPattern = /\*\.[0-9a-zA-Z]+$/
+const RemoteStorage = require('../../lib/remote-storage')
 
-// /**
-//  * Joins url path parts
-//  * @param {...string} args url parts
-//  * @returns {string}
-//  */
-function urlJoin (...args) {
-  let start = ''
-  if (args[0] &&
-      args[0].startsWith('/')) {
-    start = '/'
-  }
-  return start + args.map(a => a && a.replace(/(^\/|\/$)/g, ''))
-    .filter(a => a) // remove empty strings / nulls
-    .join('/')
-}
+describe('RemoteStorage', () => {
+  beforeEach(() => {
+    // resets all mock s3 functions, do not use jest.resetAllMocks() as it also resets the s3 client constructor mock
+    mockS3.listObjectsV2.mockReset()
+    mockS3.deleteObjects.mockReset()
+    mockS3.putObject.mockReset()
+    S3.mockClear()
+    // resets the mock fs
+    global.cleanFs(vol)
+  })
 
-module.exports = class RemoteStorage {
-  /**
-   * @param  {object} creds
-   * @param  {string} creds.accessKeyId
-   * @param  {string} creds.secretAccessKey
-   * @param  {string} creds.params.Bucket
-   * @param  {string} [creds.sessionToken]
-   */
-  constructor (creds) {
-    const res = joi.object().keys({
-      sessionToken: joi.string(),
-      accessKeyId: joi.string().required(),
-      secretAccessKey: joi.string().required(),
-      // hacky needs s3Bucket in creds.params.Bucket
-      params: joi.object().keys({ Bucket: joi.string().required() }).required()
-    }).unknown()
-      .validate(creds)
-    if (res.error) {
-      throw res.error
-    }
+  test('Constructor should throw when missing credentials', async () => {
+    const instantiate = () => new RemoteStorage({})
+    expect(instantiate.bind(this)).toThrowWithMessageContaining(['required'])
+  })
 
-    // the TVM response could be passed as is to the v2 client constructor, but the v3 client follows a different format
-    // see https://github.com/adobe/aio-tvm/issues/85
-    const region = creds.region || 'us-east-1'
-    // note this must supports TVM + BYO use cases
-    // see https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/clients/client-s3/interfaces/credentials.html
-    const credentials = {
-      accessKeyId: creds.accessKeyId,
-      secretAccessKey: creds.secretAccessKey,
-      sessionToken: creds.sessionToken,
-      expiration: creds.expiration
-    }
-    this.bucket = creds.params.Bucket
-
-    // https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/clients/client-s3/classes/s3.html#constructor
-    this.s3 = new S3({ credentials, region })
-  }
-
-  /**
-   * Checks if prefix exists
-   * @param  {string} prefix
-   * @returns {boolean}
-   */
-  async folderExists (prefix) {
-    if (typeof prefix !== 'string') {
-      throw new Error('prefix must be a valid string')
-    }
-    const listParams = {
-      Bucket: this.bucket,
-      Prefix: prefix
-    }
-    const listedObjects = await this.s3.listObjectsV2(listParams)
-
-    return listedObjects.KeyCount > 0
-  }
-
-  /**
-   * Deletes all files in a prefix location
-   * @param  {string} prefix
-   */
-  async emptyFolder (prefix) {
-    if (typeof prefix !== 'string') throw new Error('prefix must be a valid string')
-    const listParams = {
-      Bucket: this.bucket,
-      Prefix: prefix
-    }
-    const listedObjects = await this.s3.listObjectsV2(listParams)
-
-    if (listedObjects.KeyCount < 1) {
-      return
-    }
-    const deleteParams = {
-      Bucket: this.bucket,
-      Delete: { Objects: [] }
-    }
-    listedObjects.Contents.forEach(({ Key }) => {
-      deleteParams.Delete.Objects.push({ Key })
+  test('Constructor initializes the S3 constructor properly using tvm credentials', async () => {
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    expect(S3).toHaveBeenCalledWith({
+      credentials: {
+        accessKeyId: global.fakeTVMResponse.accessKeyId,
+        secretAccessKey: global.fakeTVMResponse.secretAccessKey,
+        sessionToken: global.fakeTVMResponse.sessionToken,
+        expiration: global.fakeTVMResponse.expiration
+      },
+      region: 'us-east-1'
     })
-    await this.s3.deleteObjects(deleteParams)
-    if (listedObjects.IsTruncated) {
-      await this.emptyFolder(prefix)
-    }
-  }
+    rs.bucket = global.fakeTVMResponse.Bucket
+  })
 
-  /**
-   * Uploads a file
-   * @param  {string} file
-   * @param  {string} prefix - prefix to upload the file to
-   * @param  {Object} appConfig - application config
-   * @param  {string} distRoot - Distribution root dir
-   */
-  async uploadFile (file, prefix, appConfig, distRoot) {
-    if (typeof prefix !== 'string') {
-      throw new Error('prefix must be a valid string')
-    }
-    const content = await fs.readFile(file)
-    const mimeType = mime.lookup(path.extname(file))
-    const cacheControlString = this._getCacheControlConfig(mimeType, appConfig.app)
-    const uploadParams = {
-      Bucket: this.bucket,
-      Key: urlJoin(prefix, path.basename(file)),
-      Body: content,
-      CacheControl: cacheControlString
-    }
-    // add response headers if specified in manifest
-    const responseHeaders = this.getResponseHeadersForFile(file, distRoot, appConfig)
-    if (responseHeaders) {
-      uploadParams.Metadata = responseHeaders
-    }
-    // s3 misses some mime types like for css files
-    if (mimeType) {
-      uploadParams.ContentType = mimeType
-    }
+  test('Constructor initializes the S3 constructor properly using byo credentials', async () => {
+    const rs = new RemoteStorage(global.fakeBYOCredentials)
+    expect(S3).toHaveBeenCalledWith({
+      credentials: {
+        accessKeyId: global.fakeTVMResponse.accessKeyId,
+        secretAccessKey: global.fakeTVMResponse.secretAccessKey
+      },
+      region: 'us-east-1'
+    })
+    rs.bucket = global.fakeTVMResponse.Bucket
+  })
 
-    // Note: putObject is recommended for files < 100MB and has a limit of 5GB, which is ok for our use case of storing static web assets
-    // if we intend to store larger files, we should use multipart upload and https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/modules/_aws_sdk_lib_storage.html
-    return this.s3.putObject(uploadParams)
-  }
+  test('folderExists missing prefix', async () => {
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    await expect(rs.folderExists()).rejects.toEqual(expect.objectContaining({ message: 'prefix must be a valid string' }))
+  })
 
-  getResponseHeadersForFile (file, distRoot, appConfig) {
-    let responseHeaders
-    if (appConfig.web && appConfig.web['response-headers']) {
-      responseHeaders = {}
-      const cdnConfig = appConfig.web['response-headers']
-      const headerPrefix = 'adp-'
+  test('emptyFolder missing prefix', async () => {
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    await expect(rs.emptyFolder()).rejects.toEqual(expect.objectContaining({ message: 'prefix must be a valid string' }))
+  })
 
-      Object.keys(cdnConfig).forEach(rule => {
-        if (this.canAddHeader(file, distRoot, rule)) {
-          Object.keys(cdnConfig[rule]).forEach(header => {
-            this.validateHTTPHeader(header, cdnConfig[rule][header])
-            responseHeaders[headerPrefix + header] = cdnConfig[rule][header]
-          })
+  test('uploadFile missing prefix', async () => {
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    await expect(rs.uploadFile()).rejects.toEqual(expect.objectContaining({ message: 'prefix must be a valid string' }))
+  })
+
+  test('uploadDir missing prefix', async () => {
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    await expect(rs.uploadDir()).rejects.toEqual(expect.objectContaining({ message: 'prefix must be a valid string' }))
+  })
+
+  test('folderExists should return false if there are no files', async () => {
+    mockS3.listObjectsV2.mockResolvedValue({ KeyCount: 0 })
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    expect((await rs.folderExists('fakeprefix'))).toBe(false)
+    expect(mockS3.listObjectsV2).toHaveBeenCalledWith({ Bucket: 'fake-bucket', Prefix: 'fakeprefix' })
+  })
+
+  test('folderExists should return true if there are files', async () => {
+    mockS3.listObjectsV2.mockResolvedValue({ KeyCount: 1 })
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    expect((await rs.folderExists('fakeprefix'))).toBe(true)
+  })
+
+  test('emptyFolder should not throw if there are no files', async () => {
+    mockS3.listObjectsV2.mockResolvedValue({ KeyCount: 0 })
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    expect(rs.emptyFolder.bind(rs, 'fakeprefix')).not.toThrow()
+  })
+
+  test('emptyFolder should not call S3#deleteObjects if already empty', async () => {
+    mockS3.listObjectsV2.mockResolvedValue({ KeyCount: 0 })
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    await rs.emptyFolder('fakeprefix')
+    expect(mockS3.deleteObjects).toHaveBeenCalledTimes(0)
+  })
+
+  test('emptyFolder should call S3#deleteObjects with correct parameters with one file', async () => {
+    const content = [{ Key: 'fakeprefix/index.html' }]
+    mockS3.listObjectsV2.mockResolvedValue({ KeyCount: 1, Contents: content })
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    await rs.emptyFolder('fakeprefix')
+    expect(mockS3.deleteObjects).toHaveBeenCalledWith({ Bucket: 'fake-bucket', Delete: { Objects: content } })
+  })
+
+  test('emptyFolder should call S3#deleteObjects with correct parameters with multiple files', async () => {
+    const content = [{ Key: 'fakeprefix/index.html' }, { Key: 'fakeprefix/index.css' }, { Key: 'fakeprefix/index.css' }]
+    mockS3.listObjectsV2.mockResolvedValue({ KeyCount: 3, Contents: content })
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    await rs.emptyFolder('fakeprefix')
+    expect(mockS3.deleteObjects).toHaveBeenCalledWith({ Bucket: 'fake-bucket', Delete: { Objects: content } })
+  })
+
+  test('emptyFolder should call S3#deleteObjects multiple time if listObjects is truncated', async () => {
+    const content = [{ Key: 'fakeprefix/index.html' }, { Key: 'fakeprefix/index.css' }, { Key: 'fakeprefix/index.js' }]
+    let iterations = 2
+    mockS3.listObjectsV2.mockImplementation(() => {
+      const res = { Contents: [content[iterations]], IsTruncated: iterations > 0 }
+      iterations--
+      return Promise.resolve(res)
+    })
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    await rs.emptyFolder('fakeprefix')
+    expect(mockS3.deleteObjects).toHaveBeenCalledWith({ Bucket: 'fake-bucket', Delete: { Objects: [content[0]] } })
+    expect(mockS3.deleteObjects).toHaveBeenCalledWith({ Bucket: 'fake-bucket', Delete: { Objects: [content[1]] } })
+    expect(mockS3.deleteObjects).toHaveBeenCalledWith({ Bucket: 'fake-bucket', Delete: { Objects: [content[2]] } })
+  })
+
+  test('uploadFile should call S3#upload with the correct parameters', async () => {
+    global.addFakeFiles(vol, 'fakeDir', { 'index.js': 'fake content' })
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    const fakeConfig = global.fakeConfig
+    await rs.uploadFile('fakeDir/index.js', 'fakeprefix', fakeConfig)
+    const body = Buffer.from('fake content', 'utf8')
+    expect(mockS3.putObject).toHaveBeenCalledWith(expect.objectContaining({ Bucket: 'fake-bucket', Key: 'fakeprefix/index.js', Body: body, ContentType: 'application/javascript' }))
+  })
+
+  test('uploadFile should call S3#upload with the correct parameters and slash-prefix', async () => {
+    global.addFakeFiles(vol, 'fakeDir', { 'index.js': 'fake content' })
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    const fakeConfig = global.fakeConfig
+    await rs.uploadFile('fakeDir/index.js', '/slash-prefix', fakeConfig)
+    const body = Buffer.from('fake content', 'utf8')
+    expect(mockS3.putObject).toHaveBeenCalledWith(expect.objectContaining({ Bucket: 'fake-bucket', Key: '/slash-prefix/index.js', Body: body, ContentType: 'application/javascript' }))
+  })
+
+  test('uploadFile S3#upload with an unknown Content-Type', async () => {
+    global.addFakeFiles(vol, 'fakeDir', { 'index.mst': 'fake content' })
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    const fakeConfig = {}
+    await rs.uploadFile('fakeDir/index.mst', 'fakeprefix', fakeConfig)
+    const body = Buffer.from('fake content', 'utf8')
+    expect(mockS3.putObject).toHaveBeenCalledWith(expect.objectContaining({ Bucket: 'fake-bucket', Key: 'fakeprefix/index.mst', Body: body }))
+    expect(mockS3.putObject.mock.calls[0][0]).not.toHaveProperty('ContentType')
+  })
+
+  test('uploadDir should call S3#upload one time per file', async () => {
+    await global.addFakeFiles(vol, 'fakeDir', ['index.js', 'index.css', 'index.html'])
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    await rs.uploadDir('fakeDir', 'fakeprefix', global.fakeConfig)
+    expect(mockS3.putObject).toHaveBeenCalledTimes(3)
+  })
+
+  test('uploadDir should call a callback once per uploaded file', async () => {
+    await global.addFakeFiles(vol, 'fakeDir', ['index.js', 'index.css', 'index.html', 'test/i.js'])
+    const cbMock = jest.fn()
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+
+    await rs.uploadDir('fakeDir', 'fakeprefix', global.fakeConfig, cbMock)
+    expect(cbMock).toHaveBeenCalledTimes(4)
+  })
+
+  test('cachecontrol string for html', async () => {
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    const response = rs._getCacheControlConfig('text/html', global.fakeConfig.app)
+    expect(response).toBe('s-maxage=0, max-age=60')
+  })
+
+  test('cachecontrol string for JS', async () => {
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    const response = rs._getCacheControlConfig('application/javascript', global.fakeConfig.app)
+    expect(response).toBe('s-maxage=0, max-age=604800')
+  })
+
+  test('cachecontrol string for CSS', async () => {
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    const response = rs._getCacheControlConfig('text/css', global.fakeConfig.app)
+    expect(response).toBe('s-maxage=0, max-age=604800')
+  })
+
+  test('cachecontrol string for Image', async () => {
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    const response = rs._getCacheControlConfig('image/jpeg', global.fakeConfig.app)
+    expect(response).toBe('s-maxage=0, max-age=604800')
+  })
+
+  test('cachecontrol string for default', async () => {
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    const response = rs._getCacheControlConfig('application/pdf', global.fakeConfig.app)
+    expect(response).toBe('s-maxage=0')
+  })
+
+  // response header tests
+  test('get response header from config with multiple rules', async () => {
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    const newConfig = global.configWithModifiedWeb(global.fakeConfig, {
+      'response-headers': {
+        '/*': {
+          testHeader: 'generic-header'
+        },
+        '/testFolder/*': {
+          testHeader: 'folder-header'
+        },
+        '/testFolder/*.js': {
+          testHeader: 'all-js-file-in-folder-header'
+        },
+        '/test.js': {
+          testHeader: 'specific-file-header'
         }
-      })
-    }
-    return responseHeaders
-  }
-
-  canAddHeader (file, distRoot, rule) {
-    const filePath = file.substring(0, file.lastIndexOf(path.sep))
-    const normalisedRule = rule.replace(/\//g, path.sep)
-    const ruleFolderPath = normalisedRule.substring(0, normalisedRule.lastIndexOf(path.sep))
-
-    console.log('-------- ' + normalisedRule + ' ************** ' + distRoot)
-    console.log('----file path---- ' + filePath)
-    console.log('----ruleFolderPath---- ' + ruleFolderPath)
-
-    if (rule === '/*') { // all content
-      return true
-    } else if (rule.endsWith('/*')) { // all content in a folder ex. /test/*
-      const matchPath = path.join(distRoot, ruleFolderPath)
-      if (filePath === matchPath) { // matches with the folder
-        return true
       }
-    } else if (fileExtensionPattern.test(rule)) { // all content with a given extension ex. /*.html or /test/*.js
-      // check file has same extension as specified in header
-      let extension = rule.match(fileExtensionPattern)[0]
-      extension = extension.substring(1)
-      if (file.endsWith(extension) && filePath.endsWith(ruleFolderPath)) {
-        return true
-      }
-    } else { // specific file match ex. /test/foo.js
-      const uploadFilePath = path.join(distRoot, normalisedRule)
-      if (file === uploadFilePath) {
-        return true
-      }
-    }
-    return false
-  }
-
-  validateHTTPHeader (headerName, value) {
-    try {
-      http.validateHeaderName(headerName)
-    } catch (e) {
-      logAndThrow(new codes.ERROR_INVALID_HEADER_NAME({ messageValues: [headerName], sdkDetails: {} }))
-    }
-
-    try {
-      http.validateHeaderValue(headerName, value)
-    } catch (e) {
-      logAndThrow(new codes.ERROR_INVALID_HEADER_VALUE({ messageValues: [value, headerName], sdkDetails: {} }))
-    }
-  }
-
-  async walkDir (dir) {
-    return new Promise((resolve, reject) => {
-      const items = []
-      klaw(dir)
-        .on('data', fd => {
-          if (fd.stats.isFile()) {
-            items.push(fd.path)
-          }
-        })
-        .on('end', () => resolve(items))
     })
-  }
 
-  /**
-   * Uploads all files in a dir to - recursion is supported
-   * @param  {string} dir - directory with files to upload
-   * @param  {string} prefix - prefix to upload the dir to
-   * @param  {Object} appConfig - application config
-   * @param  {function} [postFileUploadCallback] - called for each uploaded file
-   */
-  async uploadDir (dir, prefix, appConfig, postFileUploadCallback) {
-    if (typeof prefix !== 'string') {
-      throw new Error('prefix must be a valid string')
+    const folderPath1 = 'testFolder' + path.sep + 'index.html'
+    const folderPath2 = 'testFolder' + path.sep + 'test.js'
+    await global.addFakeFiles(vol, 'fakeDir', ['index.html', 'test.js', folderPath1, folderPath2])
+    const files = await rs.walkDir('fakeDir')
+    const fakeDistRoot = files[0].substring(0, files[0].indexOf('index.html'))
+
+    const expectedValMap = {
+      'index.html': { 'adp-testHeader': 'generic-header' },
+      'test.js': { 'adp-testHeader': 'specific-file-header' }
     }
-    // walk the whole directory recursively using klaw.
-    const files = await this.walkDir(dir)
+    expectedValMap[folderPath1] = { 'adp-testHeader': 'folder-header' }
+    expectedValMap[folderPath2] = { 'adp-testHeader': 'all-js-file-in-folder-header' }
 
-    // parallel upload
-    return Promise.all(files.map(async f => {
-      // get file's relative folder to the base directory.
-      let prefixDirectory = path.dirname(path.relative(dir, f))
-      // base directory returns ".", ignore that.
-      prefixDirectory = prefixDirectory === '.' ? '' : prefixDirectory
-      // newPrefix is now the initial prefix plus the files relative directory path.
-      const newPrefix = urlJoin(prefix, prefixDirectory)
-      const s3Res = await this.uploadFile(f, newPrefix, appConfig, dir)
+    files.forEach(f => {
+      const fileName = f.replace(fakeDistRoot, '')
+      const response = rs.getResponseHeadersForFile(f, fakeDistRoot, newConfig)
+      const expected = expectedValMap[fileName]
+      expect(response).toStrictEqual(expected)
+    })
+  })
 
-      if (postFileUploadCallback) {
-        postFileUploadCallback(f)
+  test('get response header with invalid header name', async () => {
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    const newConfig = global.configWithModifiedWeb(global.fakeConfig, {
+      'response-headers': {
+        '/*': {
+          無効な名前: 'generic-header'
+        }
       }
-      return s3Res
-    }))
-  }
+    })
 
-  /**
-    * Get cache control string based on mime type and config
-    * @param {string|boolean} mimeType - string if valid mimeType or false for unknown files
-    * @param  {Object} appConfig - application config
-    */
-  _getCacheControlConfig (mimeType, appConfig) {
-    const cacheControlStr = 's-maxage=0'
-    if (!mimeType) {
-      return cacheControlStr
-    } else if (mimeType === mime.lookup('html')) {
-      return cacheControlStr + ', max-age=' + appConfig.htmlCacheDuration
-    } else if (mimeType === mime.lookup('js')) {
-      return cacheControlStr + ', max-age=' + appConfig.jsCacheDuration
-    } else if (mimeType === mime.lookup('css')) {
-      return cacheControlStr + ', max-age=' + appConfig.cssCacheDuration
-    } else if (mimeType.startsWith('image')) {
-      return cacheControlStr + ', max-age=' + appConfig.imageCacheDuration
-    } else { return cacheControlStr }
-  }
-}
+    const fakeDistRoot = '/fake/web-prod/'
+    expect(() => rs.getResponseHeadersForFile(fakeDistRoot + 'index.html', fakeDistRoot, newConfig)).toThrowWithMessageContaining(
+      '[WebLib:ERROR_INVALID_HEADER_NAME] `無効な名前` is not a valid response header name')
+  })
+
+  test('get response header with invalid header value', async () => {
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    const newConfig = global.configWithModifiedWeb(global.fakeConfig, {
+      'response-headers': {
+        '/*': {
+          testHeader: '無効な値'
+        }
+      }
+    })
+
+    const fakeDistRoot = '/fake/web-prod/'
+    expect(() => rs.getResponseHeadersForFile(fakeDistRoot + 'index.html', fakeDistRoot, newConfig)).toThrowWithMessageContaining(
+      '[WebLib:ERROR_INVALID_HEADER_VALUE] `無効な値` is not a valid response header value for `testHeader`')
+  })
+
+  test('Metadata check for response headers', async () => {
+    global.addFakeFiles(vol, 'fakeDir', { 'index.js': 'fake content' })
+    const rs = new RemoteStorage(global.fakeTVMResponse)
+    const newConfig = global.configWithModifiedWeb(global.fakeConfig, {
+      'response-headers': {
+        '/*': {
+          testHeader: 'generic-header'
+        }
+      }
+    })
+    // const fakeConfig = {}
+    await rs.uploadFile('fakeDir/index.js', 'fakeprefix', newConfig)
+    const body = Buffer.from('fake content', 'utf8')
+    const expected = {
+      Bucket: 'fake-bucket',
+      Key: 'fakeprefix/index.js',
+      Body: body,
+      ContentType: 'application/javascript',
+      Metadata: {
+        'adp-testHeader': 'generic-header'
+      }
+    }
+    expect(mockS3.putObject).toHaveBeenCalledWith(expect.objectContaining(expected))
+  })
+})
